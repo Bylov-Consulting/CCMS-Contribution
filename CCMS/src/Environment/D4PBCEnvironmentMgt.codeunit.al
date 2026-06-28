@@ -403,7 +403,11 @@ codeunit 62000 "D4P BC Environment Mgt"
                                 year := JsonValue.AsInteger();
                             end;
 
-                            expectedAvailability := Format(year) + '/' + PadStr('', 2 - StrLen(Format(month)), '0') + Format(month);
+                            // Guard against PadStr negative-length runtime errors (month outside
+                            // 1..12) and against meaningless output (year = 0). If inputs are
+                            // invalid, leave expectedAvailability as the empty default.
+                            if (month in [1 .. 12]) and (year > 0) then
+                                expectedAvailability := Format(year) + '/' + PadStr('', 2 - StrLen(Format(month)), '0') + Format(month);
                         end;
                     end;
                 end;
@@ -630,31 +634,24 @@ codeunit 62000 "D4P BC Environment Mgt"
     var
         BCSetup: Record "D4P BC Setup";
         BCTenant: Record "D4P BC Tenant";
+        Parser: Codeunit "D4P BC Update Parser";
         ProgressDialog: Dialog;
-        CurrentUpdate: Integer;
-        EntryNo: Integer;
-        TotalUpdates: Integer;
-        JsonArray: JsonArray;
-        JsonExpectedAvailability: JsonObject;
-        JsonObjectLoop: JsonObject;
-        JsonResponse: JsonObject;
-        JsonScheduleDetails: JsonObject;
-        JsonToken: JsonToken;
-        JsonTokenLoop: JsonToken;
-        JsonValue: JsonValue;
         FailedToFetchErr: Label 'Failed to fetch available updates: %1', Comment = '%1 = Error message';
         FetchingUpdatesMsg: Label 'Fetching available updates...';
         NoUpdatesFoundMsg: Label 'No updates found in API response for environment %1.', Comment = '%1 = Environment Name';
-        ProcessingUpdateMsg: Label 'Processing update #1#### of #2####: #3####################', Comment = '%1 = index, %2 = total number of updates, %3 = Progress bar';
         Endpoint: Text;
         ResponseText: Text;
     begin
         BCTenant.Get(BCEnvironment."Customer No.", BCEnvironment."Tenant ID");
         BCSetup.Get();
         TempAvailableUpdate.Reset();
-        TempAvailableUpdate.DeleteAll();
+        TempAvailableUpdate.DeleteAll(false);
 
-        // Show progress dialog
+        // Show a single indeterminate progress dialog for the whole fetch+parse. NOTE: the
+        // earlier per-update "Processing update #N" dialog was intentionally dropped when JSON
+        // parsing moved to the pure D4P BC Update Parser codeunit (which does no UI). A per-row
+        // dialog would either be cosmetic theatre over already-parsed rows or would re-couple UI
+        // into the pure parser, so the card now shows one "Fetching available updates..." dialog.
         ProgressDialog.Open(FetchingUpdatesMsg);
 
         // Call Admin API to get available updates
@@ -668,118 +665,16 @@ codeunit 62000 "D4P BC Environment Mgt"
         if BCSetup."Debug Mode" then
             Message('DEBUG - Get Available Updates:\%1', ResponseText);
 
-        JsonResponse.ReadFrom(ResponseText);
+        // Delegate the JSON shape handling (incl. the latestSelectableDateTime vs
+        // latestSelectableDate API quirk) to the pure parser. Behaviour-preserving
+        // refactor per plan §8 step 12: same public signature, same dialog, same
+        // "no updates found" user message.
+        Parser.ParseUpdatesJson(ResponseText, TempAvailableUpdate);
 
-        if JsonResponse.Get('value', JsonToken) then begin
-            JsonArray := JsonToken.AsArray();
-            TotalUpdates := JsonArray.Count();
-            EntryNo := 0;
+        ProgressDialog.Close();
 
-            if TotalUpdates = 0 then begin
-                ProgressDialog.Close();
-                Message(NoUpdatesFoundMsg, BCEnvironment.Name);
-                exit;
-            end;
-
-            ProgressDialog.Close();
-            ProgressDialog.Open(ProcessingUpdateMsg);
-
-            foreach JsonTokenLoop in JsonArray do begin
-                JsonObjectLoop := JsonTokenLoop.AsObject();
-                EntryNo += 1;
-                CurrentUpdate := EntryNo;
-
-                TempAvailableUpdate.Init();
-                TempAvailableUpdate."Entry No." := EntryNo;
-
-                // Update progress dialog
-                ProgressDialog.Update(1, CurrentUpdate);
-                ProgressDialog.Update(2, TotalUpdates);
-
-                // Get target version
-                if JsonObjectLoop.Get('targetVersion', JsonToken) then begin
-                    JsonValue := JsonToken.AsValue();
-                    TempAvailableUpdate."Target Version" := CopyStr(JsonValue.AsText(), 1, MaxStrLen(TempAvailableUpdate."Target Version"));
-                    ProgressDialog.Update(3, TempAvailableUpdate."Target Version");
-                end;
-
-                // Get availability status
-                if JsonObjectLoop.Get('available', JsonToken) then begin
-                    JsonValue := JsonToken.AsValue();
-                    TempAvailableUpdate.Available := JsonValue.AsBoolean();
-                end;
-
-                // Get selected status
-                if JsonObjectLoop.Get('selected', JsonToken) then begin
-                    JsonValue := JsonToken.AsValue();
-                    TempAvailableUpdate.Selected := JsonValue.AsBoolean();
-                end;
-
-                // Get target version type
-                if JsonObjectLoop.Get('targetVersionType', JsonToken) then begin
-                    JsonValue := JsonToken.AsValue();
-                    TempAvailableUpdate."Target Version Type" := CopyStr(JsonValue.AsText(), 1, MaxStrLen(TempAvailableUpdate."Target Version Type"));
-                end;
-
-                // Get schedule details if available (for released versions)
-                if JsonObjectLoop.Get('scheduleDetails', JsonToken) then begin
-                    JsonScheduleDetails := JsonToken.AsObject();
-
-                    // Get selected date time
-                    if JsonScheduleDetails.Get('selectedDateTime', JsonToken) then begin
-                        JsonValue := JsonToken.AsValue();
-                        if not JsonValue.IsNull() then
-                            TempAvailableUpdate."Selected DateTime" := DT2Date(JsonValue.AsDateTime());
-                    end;
-
-                    // Get latest selectable date - try both field names (API inconsistency)
-                    if JsonScheduleDetails.Get('latestSelectableDateTime', JsonToken) then begin
-                        JsonValue := JsonToken.AsValue();
-                        if not JsonValue.IsNull() then
-                            TempAvailableUpdate."Latest Selectable Date" := DT2Date(JsonValue.AsDateTime());
-                    end else
-                        if JsonScheduleDetails.Get('latestSelectableDate', JsonToken) then begin
-                            JsonValue := JsonToken.AsValue();
-                            if not JsonValue.IsNull() then
-                                TempAvailableUpdate."Latest Selectable Date" := DT2Date(JsonValue.AsDateTime());
-                        end;
-
-                    // Get ignore update window
-                    if JsonScheduleDetails.Get('ignoreUpdateWindow', JsonToken) then begin
-                        JsonValue := JsonToken.AsValue();
-                        TempAvailableUpdate."Ignore Update Window" := JsonValue.AsBoolean();
-                    end;
-
-                    // Get rollout status
-                    if JsonScheduleDetails.Get('rolloutStatus', JsonToken) then begin
-                        JsonValue := JsonToken.AsValue();
-                        TempAvailableUpdate."Rollout Status" := CopyStr(JsonValue.AsText(), 1, MaxStrLen(TempAvailableUpdate."Rollout Status"));
-                    end;
-                end;
-
-                // Get expected availability if available (for unreleased versions)
-                if JsonObjectLoop.Get('expectedAvailability', JsonToken) then begin
-                    JsonExpectedAvailability := JsonToken.AsObject();
-
-                    if JsonExpectedAvailability.Get('month', JsonToken) then begin
-                        JsonValue := JsonToken.AsValue();
-                        TempAvailableUpdate."Expected Month" := JsonValue.AsInteger();
-                    end;
-
-                    if JsonExpectedAvailability.Get('year', JsonToken) then begin
-                        JsonValue := JsonToken.AsValue();
-                        TempAvailableUpdate."Expected Year" := JsonValue.AsInteger();
-                    end;
-                end;
-
-                TempAvailableUpdate.Insert();
-            end;
-
-            ProgressDialog.Close();
-        end else begin
-            ProgressDialog.Close();
+        if TempAvailableUpdate.IsEmpty() then
             Message(NoUpdatesFoundMsg, BCEnvironment.Name);
-        end;
     end;
 
     procedure SelectTargetVersion(var BCEnvironment: Record "D4P BC Environment"; TargetVersion: Text[100]; SelectedDate: Date; ExpectedMonth: Integer; ExpectedYear: Integer)

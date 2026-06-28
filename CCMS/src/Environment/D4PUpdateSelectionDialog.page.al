@@ -172,6 +172,11 @@ page 62025 "D4P Update Selection Dialog"
         ExpectedYear := Rec."Expected Year";
     end;
 
+    procedure GetLatestSelectableDate(): Date
+    begin
+        exit(Rec."Latest Selectable Date");
+    end;
+
     procedure SetData(var TempSourceUpdate: Record "D4P BC Available Update" temporary)
     begin
         // Copy all records from source temporary table to page's temporary table

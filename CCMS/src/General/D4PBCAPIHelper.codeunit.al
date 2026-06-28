@@ -6,6 +6,17 @@ using System.Security.Authentication;
 
 codeunit 62049 "D4P BC API Helper"
 {
+    // SingleInstance so the per-tenant OAuth token cache (see GetOAuthToken) survives across
+    // the many short-lived APIHelper variables the module instantiates, letting a still-valid
+    // token be reused for the whole session instead of re-acquired on every request.
+    SingleInstance = true;
+
+    var
+        // Cached client-credential tokens keyed by "<tenant id>|<client id>", with the parallel
+        // expiry map below. Reused until shortly before expiry; SecretText keeps the token opaque.
+        CachedTokens: Dictionary of [Text, SecretText];
+        CachedTokenExpiry: Dictionary of [Text, DateTime];
+
     procedure SendAdminAPIRequest(var BCTenant: Record "D4P BC Tenant"; Method: Text; Endpoint: Text; RequestBody: Text; var ResponseText: Text): Boolean
     var
         HttpClient: HttpClient;
@@ -107,15 +118,51 @@ codeunit 62049 "D4P BC API Helper"
         ClientSecret: SecretText;
         AccessTokenURL: Text;
         tenantID: Text;
+        CacheKey: Text;
     begin
         tenantID := BCTenant."Tenant ID".ToText().Replace('{', '');
         tenantID := tenantID.Replace('}', '');
+
+        // Reuse a still-valid cached token for this tenant/client instead of re-acquiring on
+        // every request; only fall through to Azure AD when the token is missing or near expiry.
+        CacheKey := tenantID + '|' + Format(BCTenant."Client ID");
+        if TryGetCachedToken(CacheKey, AuthToken) then
+            exit;
+
         AccessTokenURL := 'https://login.microsoftonline.com/' + tenantID + '/oauth2/v2.0/token';
         Scopes.Add('https://api.businesscentral.dynamics.com/.default');
 
         ClientSecret := BCTenant.GetClientSecret();
         if not OAuth2.AcquireTokenWithClientCredentials(BCTenant."Client ID", ClientSecret, AccessTokenURL, '', Scopes, AuthToken) then
             Error(FailedToGetTokenErr, GetLastErrorText());
+
+        CacheToken(CacheKey, AuthToken);
+    end;
+
+    local procedure TryGetCachedToken(CacheKey: Text; var AuthToken: SecretText): Boolean
+    var
+        ExpiresAt: DateTime;
+    begin
+        if not CachedTokens.ContainsKey(CacheKey) then
+            exit(false);
+        if not CachedTokenExpiry.Get(CacheKey, ExpiresAt) then
+            exit(false);
+
+        // Treat a token within the safety window of its expiry as already gone, so an
+        // in-flight request never races the boundary on the server side.
+        if CurrentDateTime() >= ExpiresAt then
+            exit(false);
+
+        AuthToken := CachedTokens.Get(CacheKey);
+        exit(not AuthToken.IsEmpty());
+    end;
+
+    local procedure CacheToken(CacheKey: Text; AuthToken: SecretText)
+    begin
+        CachedTokens.Set(CacheKey, AuthToken);
+        // Azure AD client-credential tokens are valid ~60-90 min. Cache for a conservative
+        // 50-minute window so we always re-acquire comfortably before the real expiry.
+        CachedTokenExpiry.Set(CacheKey, CurrentDateTime() + (50 * 60 * 1000));
     end;
 
     procedure GetAutomationApiOAuthToken(AADTenantId: Guid; ClientID: Text; ClientSecret: SecretText) AuthToken: SecretText
